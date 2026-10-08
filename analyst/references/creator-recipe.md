@@ -62,7 +62,7 @@ await page.evaluate(() => {
 
 按 references/guide-format.md 的 snapshot schema 组装 JSON 写盘。任务成功 `await task.finish({ keep: [] })`；用户接管或出错时不要 finish。
 
-## 已知坑（来自 xiaohongshu-publisher 同域经验）
+## 已知坑（来自 note-series-publisher 同域经验）
 
 - 搜索/列表页渲染器可能假死：`page.evaluate(() => document.title)` 探活，超时就 `reload` 一次，仍死则换 `task.newPage()` 续做。
 - 意外弹窗（alert/confirm）会挂死主线程：每次加载后查 `page.info().dialog`，有则 `dismissDialog()`。

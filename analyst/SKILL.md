@@ -1,22 +1,22 @@
 ---
-name: xiaohongshu-analyst
-slug: xiaohongshu-analyst
-displayName: 小红书复盘分析师
+name: creator-retro-analyst
+slug: creator-retro-analyst
+displayName: 账号复盘分析师
 version: 1.0.0
 summary: 只读采集小红书账号数据，周期复盘、验证假设、进化文风指南，沉淀到 Obsidian
-description: 小红书账号复盘与文风进化闭环：用 Ego Lite 只读采集创作者中心/主页的笔记数据（曝光/阅读/赞藏评/涨粉），周期性分析表现规律、验证假设、迭代更新《风格指南》，并把每次复盘沉淀到 Obsidian 形成可追溯的进化历史。Use when the user mentions 小红书复盘、账号数据、笔记表现、流量/涨粉下滑、优化文风/标题/选题/封面、风格指南、内容进化 — even if they just say「复盘一下」「最近数据怎么样」「为什么没人点赞」without naming 小红书. 指南产出直接反哺 xiaohongshu-publisher 的文案写作。
+description: 小红书账号复盘与文风进化闭环：用 Ego Lite 只读采集创作者中心/主页的笔记数据（曝光/阅读/赞藏评/涨粉），周期性分析表现规律、验证假设、迭代更新《风格指南》，并把每次复盘沉淀到 Obsidian 形成可追溯的进化历史。Use when the user mentions 小红书复盘、账号数据、笔记表现、流量/涨粉下滑、优化文风/标题/选题/封面、风格指南、内容进化 — even if they just say「复盘一下」「最近数据怎么样」「为什么没人点赞」without naming 小红书. 指南产出直接反哺 note-series-publisher 的文案写作。
 metadata:
   version: "1.0.0"
   date: "2026-10-07"
-  slug: "xiaohongshu-analyst"
-  displayName: "小红书复盘分析师"
+  slug: "creator-retro-analyst"
+  displayName: "账号复盘分析师"
 ---
 
 # 小红书账号复盘与文风进化
 
-用 Ego Lite 只读采集自己账号的笔记数据 → 对比上期分析表现规律 → 验证/迭代《风格指南》→ 全过程沉淀进 Obsidian。指南被 xiaohongshu-publisher 的文案阶段（其阶段 2）消费，形成「发布 → 数据 → 优化 → 再发布」的进化闭环。
+用 Ego Lite 只读采集自己账号的笔记数据 → 对比上期分析表现规律 → 验证/迭代《风格指南》→ 全过程沉淀进 Obsidian。指南被 note-series-publisher 的文案阶段（其阶段 2）消费，形成「发布 → 数据 → 优化 → 再发布」的进化闭环。
 
-分工路由：用户要**写/发**笔记 → xiaohongshu-publisher；要**看数据/复盘/优化风格** → 本技能。两者通过 Obsidian 里的《风格指南.md》衔接。
+分工路由：用户要**写/发**笔记 → note-series-publisher；要**看数据/复盘/优化风格** → 本技能。两者通过 Obsidian 里的《风格指南.md》衔接。
 
 ## 总流程（复盘周期，默认全跑）
 
@@ -96,7 +96,7 @@ snapshot 的 `degraded: true` 只代表样本 <5；账号本身笔记少属正�
 
 ## 阶段 4 · 反哺发布
 
-复盘完成后提醒用户：《风格指南》已在 vault 生效，xiaohongshu-publisher 写文案时自动读取（其阶段 2 已接入）。指南与对标 `benchmark.json` 冲突时以指南优先——自身账号数据 > 对标样本。若发布侧没吃到指南，检查 publisher 的阶段 2 是否读到该文件。
+复盘完成后提醒用户：《风格指南》已在 vault 生效，note-series-publisher 写文案时自动读取（其阶段 2 已接入）。指南与对标 `benchmark.json` 冲突时以指南优先——自身账号数据 > 对标样本。若发布侧没吃到指南，检查 publisher 的阶段 2 是否读到该文件。
 
 ## 硬规则
 

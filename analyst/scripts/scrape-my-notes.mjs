@@ -1,4 +1,4 @@
-// 小红书自有账号数据采集器（xiaohongshu-analyst · 阶段 1）
+// 小红书自有账号数据采集器（creator-retro-analyst · 阶段 1）
 // 用法：先写任务文件 /tmp/xhs-analyst-task.json，然后：
 //   ego-browser nodejs < <skill-dir>/scripts/scrape-my-notes.mjs
 //
