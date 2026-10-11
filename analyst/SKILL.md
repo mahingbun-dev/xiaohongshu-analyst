@@ -2,21 +2,21 @@
 name: creator-retro-analyst
 slug: creator-retro-analyst
 displayName: 账号复盘分析师
-version: 1.0.0
-summary: 只读采集小红书账号数据，周期复盘、验证假设、进化文风指南，沉淀到 Obsidian
-description: 小红书账号复盘与文风进化闭环：用 Ego Lite 只读采集创作者中心/主页的笔记数据（曝光/阅读/赞藏评/涨粉），周期性分析表现规律、验证假设、迭代更新《风格指南》，并把每次复盘沉淀到 Obsidian 形成可追溯的进化历史。Use when the user mentions 小红书复盘、账号数据、笔记表现、流量/涨粉下滑、优化文风/标题/选题/封面、风格指南、内容进化 — even if they just say「复盘一下」「最近数据怎么样」「为什么没人点赞」without naming 小红书. 指南产出直接反哺 note-series-publisher 的文案写作。
+version: 1.1.0
+summary: 只读采集小红书创作者中心全量数据，周期复盘、验证假设、进化文风指南，沉淀到 Obsidian
+description: 小红书账号复盘与文风进化闭环：用 Ego Lite 只读采集创作者中心全量数据（首页总览/笔记管理/账号概览/粉丝画像/受众时段 + 主页公开数据），周期性分析表现规律、验证假设、迭代更新《风格指南》，并把每次复盘沉淀到 Obsidian 形成可追溯的进化历史。Use when the user mentions 小红书复盘、账号数据、笔记表现、流量/涨粉下滑、优化文风/标题/选题/封面、粉丝画像、风格指南、内容进化 — even if they just say「复盘一下」「最近数据怎么样」「为什么没人点赞」without naming 小红书. 指南产出直接反哺发布侧技能（note-series-publisher，本地安装名 xiaohongshu-publisher）的文案写作。
 metadata:
-  version: "1.0.0"
-  date: "2026-10-07"
+  version: "1.1.0"
+  date: "2026-10-12"
   slug: "creator-retro-analyst"
   displayName: "账号复盘分析师"
 ---
 
 # 小红书账号复盘与文风进化
 
-用 Ego Lite 只读采集自己账号的笔记数据 → 对比上期分析表现规律 → 验证/迭代《风格指南》→ 全过程沉淀进 Obsidian。指南被 note-series-publisher 的文案阶段（其阶段 2）消费，形成「发布 → 数据 → 优化 → 再发布」的进化闭环。
+用 Ego Lite 只读采集自己账号的创作者中心全量数据（曝光/阅读/赞藏评/涨粉 + 账号总览趋势 + 粉丝画像 + 受众时段）→ 对比上期分析表现规律 → 验证/迭代《风格指南》→ 全过程沉淀进 Obsidian。指南被发布侧技能（note-series-publisher，本地安装名 xiaohongshu-publisher）的文案阶段（其阶段 2）消费，形成「发布 → 数据 → 优化 → 再发布」的进化闭环。
 
-分工路由：用户要**写/发**笔记 → note-series-publisher；要**看数据/复盘/优化风格** → 本技能。两者通过 Obsidian 里的《风格指南.md》衔接。
+分工路由：用户要**写/发**笔记 → 发布侧技能；要**看数据/复盘/优化风格** → 本技能。两者通过 Obsidian 里的《风格指南.md》衔接。
 
 ## 总流程（复盘周期，默认全跑）
 
@@ -56,11 +56,11 @@ vault 内结构（缺则创建）：
 前提：Ego Lite 已登录小红书（脚本自动检查，未登录会带 `error: not-logged-in` 退出，此时提示用户在 Ego Lite 登录后重试，不要降级到无登录态抓取）。
 
 ```sh
-# /tmp/xhs-analyst-task.json: {"outDir": "<vault>/<folder>/数据 的绝对路径", "maxNotes": 50}
+# /tmp/xhs-analyst-task.json: {"outDir": "<vault>/<folder>/数据 的绝对路径", "maxNotes": 100}
 ego-browser nodejs < <skill-dir>/scripts/scrape-my-notes.mjs
 ```
 
-产出 `<outDir>/YYYY-MM-DD-snapshot.json`（schema 见 references/guide-format.md）。采集方式（2026-10-07 真实环境校准，细节见 references/creator-recipe.md）：接口带签名头、裸调返回 406，所以脚本**拦截创作者平台自身 XHR**——主路径 = 笔记管理页 posted API 滚动翻页拿全量（曝光/赞/藏/评/享/封面/xsec 链接）；补充 = 数据看板·内容分析（阅读数）+ 个人主页公开数据；正文与话题 = 自动打开点赞 top3+bottom3 的详情页；封面图 best-effort 存 `covers-YYYY-MM-DD/`。
+产出 `<outDir>/YYYY-MM-DD-snapshot.json`（schema 见 references/guide-format.md）。采集方式（v1.1，2026-10-12 全量探索校准，四页直连 URL 与 API 目录见 references/creator-recipe.md）：接口带签名头、`page.fetch` 裸调一律 406，所以脚本**拦截创作者平台自身 XHR**——首页 `/new/home`（近 7/30 日全指标+日粒度+环比、权威粉丝数）→ 账号概览（受众活跃时段、流量来源）→ 粉丝数据（涨粉趋势、铁粉榜、画像）→ 笔记管理（posted API 滚动翻页全量：曝光/赞/藏/评/享/封面/xsec 链接）；内容分析 analyze/list（阅读数，默认覆盖近 30 天发布）随导航自动拦截；正文与话题 = 自动打开点赞 top3+bottom3 的详情页；封面图 best-effort 存 `covers-YYYY-MM-DD/`（附 covers-index.json 映射）。
 
 登录态说明：**creator.xiaohongshu.com 登录即可跑通主路径**；www 登录是增量（解锁详情页正文与主页公开数据），未登录时这两项自动跳过，不阻塞复盘。
 
@@ -73,10 +73,12 @@ ego-browser nodejs < <skill-dir>/scripts/scrape-my-notes.mjs
 读本期 + 最近一期 snapshot。首次复盘无上期 → 只建基线 + 指南 v1（全部条目标记为待验证假设，向用户说明未经数据验证）。
 
 1. **队列划分**：上期之后新发布的笔记 = 假设验证队列；全量笔记 = 账号基线。
-2. **指标**：点赞/收藏/评论中位数；收藏率 = 收藏÷点赞（>1 → 干货型赛道信号，写进基线）；曝光→阅读 CTR（数据中心数据可用时）；发布时间 vs 表现分布。
-3. **规律提炼**：每条结论必须带样本量和指标对比（如「数字型标题 n=4，中位点赞 12 vs 账号 5」）。**无样本支撑的结论不许写入**——同 publisher 的 benchmark 纪律。
-4. **评分表**（写进复盘报告，扣分制 5 分起、可复现，判据见 references/guide-format.md）：标题 / 选题 / 发布节奏 / 形式 / 互动引导。
-5. 报告落盘 `数据/YYYY-MM-DD-复盘.md`（模板见 references/guide-format.md），以「下期观察点」收尾。
+2. **指标**：点赞/收藏/评论中位数；收藏率 = 收藏÷点赞（>1 → 干货型赛道信号，写进基线）；曝光→阅读 CTR（= reads÷impressions；「曝光」只认 imp_count，仅在 analyze 窗口内已产生数据的笔记下发，覆盖见 `analyzeMeta.windows`；`view_count` 是「观看」不是曝光）；发布时间 vs 表现分布。
+3. **流量漏斗与环比**（`overview` 可用时）：近 7/30 日曝光→阅读→赞藏评→涨粉漏斗与各指标环比；主页访客与人均观看时长趋势。字段为 null（旧 snapshot 或降级采集）则跳过此节，不报错。
+4. **受众匹配**（`fans.portrait` / `audience` 可用时）：粉丝画像（性别/年龄/地域/兴趣）对照本期选题；`audience.viewPeriods` 24 小时桶找活跃峰值，对照发布时间——错峰发布写进「下期观察点」。
+5. **规律提炼**：每条结论必须带样本量和指标对比（如「数字型标题 n=4，中位点赞 12 vs 账号 5」）。**无样本支撑的结论不许写入**——同 publisher 的 benchmark 纪律。
+6. **评分表**（写进复盘报告，扣分制 5 分起、可复现，判据见 references/guide-format.md）：标题 / 选题 / 发布节奏 / 形式 / 互动引导。
+7. 报告落盘 `数据/YYYY-MM-DD-复盘.md`（模板见 references/guide-format.md），以「下期观察点」收尾。
 
 snapshot 的 `degraded: true` 只代表样本 <5；账号本身笔记少属正常，全量分析即可，不中断流程。
 
@@ -96,7 +98,7 @@ snapshot 的 `degraded: true` 只代表样本 <5；账号本身笔记少属正�
 
 ## 阶段 4 · 反哺发布
 
-复盘完成后提醒用户：《风格指南》已在 vault 生效，note-series-publisher 写文案时自动读取（其阶段 2 已接入）。指南与对标 `benchmark.json` 冲突时以指南优先——自身账号数据 > 对标样本。若发布侧没吃到指南，检查 publisher 的阶段 2 是否读到该文件。
+复盘完成后提醒用户：《风格指南》已在 vault 生效，发布侧技能（note-series-publisher，本地安装名 xiaohongshu-publisher）写文案时自动读取（其阶段 2 已接入）。指南与对标 `benchmark.json` 冲突时以指南优先——自身账号数据 > 对标样本。若发布侧没吃到指南，检查其阶段 2 是否读到该文件。
 
 ## 硬规则
 

@@ -1,18 +1,27 @@
-// 小红书自有账号数据采集器（creator-retro-analyst · 阶段 1）
+// 小红书自有账号数据采集器（creator-retro-analyst · 阶段 1）v1.1
 // 用法：先写任务文件 /tmp/xhs-analyst-task.json，然后：
 //   ego-browser nodejs < <skill-dir>/scripts/scrape-my-notes.mjs
 //
 // 任务文件 schema：
 // {
 //   "outDir": "/abs/path/vault/小红书运营/数据",  // 产出目录（必填，缺省 /tmp/xhs-analyst-out）
-//   "maxNotes": 50,                               // 最多保留笔记数（默认 50）
+//   "maxNotes": 100,                              // 最多保留笔记数（默认 100）
 //   "detailCount": 6,                             // 打开详情页补全正文的笔记数（默认 6：赞 top3+bottom3）
 //   "profileUrl": "https://www.xiaohongshu.com/user/profile/<id>"  // 可选，跳过 userId 探测
 // }
 //
-// 产出：<outDir>/<YYYY-MM-DD>-snapshot.json（唯一产出，模型据此分析）
-// 多级降级：A) 创作者中心数据中心(API拦截→表格解析) → B) 内容管理 → C) 个人主页公开数据。
-// creator 未登录但 www 已登录时自动降到 C 级；两者都未登录才报 not-logged-in 退出。
+// 产出：<outDir>/<YYYY-MM-DD>-snapshot.json（唯一产出，模型据此分析）+ covers-*/（封面）+ covers-index.json
+//
+// v1.1（2026-10-12 全量探索后重写，API 目录见 references/creator-recipe.md 校准记录）：
+//   A) 创作者中心四页直连（首页→账号概览→粉丝数据→笔记管理），拦截应用自身 XHR：
+//      - 首页 /new/home：note_detail_new（近7/30日全指标+日粒度+环比）+ personal_info（权威粉丝数）
+//      - 账号概览 /statistics/account/v2：受众活跃时段 + 流量来源
+//      - 粉丝数据 /statistics/fans-data：涨粉趋势 + 铁粉榜 + 粉丝画像（性别/年龄/城市/兴趣）
+//      - 笔记管理 /new/note-manager：posted API 滚动翻页（曝光/赞/藏/评/享/封面）
+//   B) 内容分析 analyze/list（阅读数，默认近30天窗口）随页面访问自动拦截
+//   C) 个人主页公开数据（www 登录时）→ D) 详情页正文/话题（赞 top3+bottom3）
+// 已知约束（实测）：creator API 需站点签名，page.fetch 直调一律 406 —— 全部数据靠「页面加载+滚动让应用自己请求」再拦截响应。
+// 多级降级：creator 未登录但 www 已登录时降到 C 级；两者都未登录才报 not-logged-in 退出。
 // 失败不抛异常，summary 带 source/degraded/stages 字段，由调用方决定降级。
 // 纪律（见 SKILL.md 硬规则）：只读，不点赞不收藏不关注；失败不连刷。
 // 平台守卫：Windows 上无 Ego Lite，直接退出并给出指引。
@@ -28,7 +37,7 @@ import { join, resolve } from "node:path";
 const TASK_PATH = "/tmp/xhs-analyst-task.json";
 const taskDef = JSON.parse(await readFile(TASK_PATH, "utf8").catch(() => "{}"));
 const OUT = resolve(taskDef.outDir || "/tmp/xhs-analyst-out");
-const maxNotes = taskDef.maxNotes ?? 50;
+const maxNotes = taskDef.maxNotes ?? 100;
 const detailCount = taskDef.detailCount ?? 6;
 await mkdir(OUT, { recursive: true });
 
@@ -55,6 +64,10 @@ const tableRows = [];
 const textDumps = {};
 const profileNotes = [];
 const account = {};
+const overview = { noteDetailNew: null, accountBase: null };
+const fans = { overall: null, active: null, portrait: null, source: null };
+const audience = { viewPeriods: null, sourceAccount: null };
+const analyzeMeta = { total: null, windows: [] };
 let creatorOk = false;
 let wwwOk = false;
 
@@ -74,8 +87,26 @@ async function userIdFromCookie() {
   }
 }
 
-// ---------- 创作者平台 API 响应收集（宽松解析，任何 creator 域 XHR 里疑似笔记指标的条目） ----------
-// 字段别名是猜测的，无法穷举真实 API schema——因此 apiSamples 保留原始样本片段，模型分析前先核对映射。
+// 后端序列化噪音键（set_* 标志位 / *_size / *_iterator 重复体 / *_rate_display 展示开关）
+function distill(node, depth = 0) {
+  if (node === null || typeof node !== "object") return node;
+  if (Array.isArray(node)) return node.slice(0, 40).map((v) => distill(v, depth + 1));
+  if (depth > 6) return "[…]";
+  const out = {};
+  for (const [k, v] of Object.entries(node)) {
+    if (/^set_/.test(k) || /_(size|iterator)$/.test(k) || /_rate_display$/.test(k) || k === "result" || k === "color") continue;
+    out[k] = distill(v, depth + 1);
+  }
+  return out;
+}
+
+// ---------- 创作者平台 API 响应收集与分发 ----------
+// 字段映射以 2026-10-12 探索实录为准（creator-recipe.md 校准记录）：
+//   曝光 impressions = imp_count（analyze 层）/ impl_count（account 层）——只认 imp 系字段
+//   阅读 reads       = read_count（analyze 层）/ view_count（posted 层，**语义是「观看」不是曝光**，
+//                      10-12 实测与 read_count 逐篇相等；10-07 校准把 view_count 标成曝光是错的）
+//   收藏 collects    = collected_count(posted) / fav_count(analyze)
+//   涨粉 newFollowers = increase_fans_count / rise_fans_count（analyze 层部分笔记携带，常缺省）
 function harvest(node, out, depth = 0) {
   if (!node || typeof node !== "object" || depth > 8) return;
   if (Array.isArray(node)) {
@@ -95,12 +126,13 @@ function harvest(node, out, depth = 0) {
   if (typeof title === "string" && title.trim().length > 1) {
     const idOk = typeof id === "string" && /^[0-9a-f]{24}$/.test(id);
     const metrics = {
-      impressions: num("impression", "impress", "viewCount", "view_count", "view", "exposure", "readCnt"),
-      reads: num("readCount", "read_count", "read", "clickCount", "click"),
+      impressions: num("imp_count", "impl_count", "impression", "impress"),
+      reads: num("read_count", "readCount", "view_count", "viewCount"),
       likes: num("likeCount", "like_count", "likedCount", "like", "likes"),
-      collects: num("collectCount", "collected_count", "collect_count", "collected", "collect"),
+      collects: num("favCount", "fav_count", "collected_count", "collect_count", "collected", "collect"),
       comments: num("commentCount", "comments_count", "comment_count", "comment"),
       shares: num("shareCount", "shared_count", "share_count", "share"),
+      newFollowers: num("increase_fans_count", "rise_fans_count", "new_fans_count"),
     };
     const hasMetric = Object.values(metrics).some((v) => v != null);
     if (idOk || hasMetric) {
@@ -108,7 +140,8 @@ function harvest(node, out, depth = 0) {
       if (typeof pub === "number" && pub > 1e12) pub = new Date(pub).toISOString().slice(0, 16).replace("T", " ");
       else if (typeof pub === "number" && pub > 1e9) pub = new Date(pub * 1000).toISOString().slice(0, 16).replace("T", " ");
       const token = typeof node.xsec_token === "string" ? node.xsec_token : null;
-      let coverRaw = node.cover?.url ?? node.coverUrl ?? (Array.isArray(node.images_list) ? node.images_list?.[0]?.url : null) ?? node.cover_url ?? null;
+      let coverRaw =
+        node.cover?.url ?? node.coverUrl ?? (Array.isArray(node.images_list) ? node.images_list?.[0]?.url : null) ?? node.cover_url ?? null;
       if (typeof coverRaw === "string") coverRaw = coverRaw.replace(/^http:\/\//, "https://"); // 混合内容会被浏览器拦截，CDN 支持 https
       out.push({
         id: typeof id === "string" ? id : null,
@@ -116,7 +149,6 @@ function harvest(node, out, depth = 0) {
         type: typeof node.type === "string" ? node.type : null,
         publishedAt: pub,
         ...metrics,
-        newFollowers: null,
         sticky: node.sticky === true ? true : null,
         permission: typeof node.permission_msg === "string" && node.permission_msg ? node.permission_msg : null,
         coverUrl: typeof coverRaw === "string" ? (coverRaw.startsWith("//") ? "https:" + coverRaw : coverRaw) : null,
@@ -125,38 +157,87 @@ function harvest(node, out, depth = 0) {
             ? `https://www.xiaohongshu.com/explore/${id}${token ? `?xsec_token=${token}&xsec_source=pc_creatormng` : ""}`
             : null,
       });
-      if (out.length > 200) return;
+      if (out.length > 300) return;
     }
   }
   for (const v of Object.values(node)) harvest(v, out, depth + 1);
 }
 
-async function drainApi() {
+// 噪音 API（风控/监控/埋点/无关运营位），拦截时直接跳过
+const NOISE_URL =
+  /as\.xiaohongshu|apm-fe|t2\.xiaohongshu|racing|captcha|sec\/v1|shield|rightscenter|leaderboard|activity_center|\/notice\?|\/notice$|authortask|create_guidance|select\/topic|livedata|sbtsource|\/api\/v2\/collect|user\/video|permission\/query/;
+
+async function drainApi(tag) {
   try {
     const evs = await page.events();
-    const res = evs.filter(
-      (e) =>
-        e.method === "Network.responseReceived" &&
-        /xiaohongshu\.com/.test(e.params?.response?.url || "") &&
-        /(note|data|statistic|galaxy|performance|noteList)/i.test(e.params?.response?.url || "") &&
-        !/\.(css|js|png|jpg|jpeg|woff|svg|gif)/.test(e.params?.response?.url || "")
-    );
-    for (const r of res) {
-      const url = r.params?.response?.url || "";
+    const reqMeta = new Map();
+    for (const e of evs) {
+      if (e.method === "Network.requestWillBeSent") {
+        reqMeta.set(e.params.requestId, { method: e.params.request?.method, postData: e.params.request?.postData });
+      }
+    }
+    for (const e of evs) {
+      if (e.method !== "Network.responseReceived") continue;
+      const url = e.params?.response?.url || "";
+      if (!/creator\.xiaohongshu\.com\/api\/galaxy/.test(url) || NOISE_URL.test(url)) continue;
+      let json = null;
       try {
-        const body = await page.cdp("Network.getResponseBody", { requestId: r.params.requestId });
-        const raw = typeof body === "string" ? body : body.body;
-        const data = JSON.parse(raw);
+        const b = await page.cdp("Network.getResponseBody", { requestId: e.params.requestId });
+        json = JSON.parse(typeof b === "string" ? b : b.body);
+      } catch (e2) {
+        continue; // 非 JSON 或 body 已释放
+      }
+      // 分发到专项收集器（distill 去噪后整体入库），其余走通用笔记收割
+      if (/note\/user\/posted/.test(url)) {
+        harvest(json, apiNotes);
+        sample(url, json);
+      } else if (/note\/analyze\/list/.test(url)) {
         const before = apiNotes.length;
-        harvest(data, apiNotes);
-        if (apiNotes.length > before && apiSamples.length < 3) {
-          apiSamples.push({ url: url.slice(0, 120), sample: JSON.stringify(data).slice(0, 1500) });
+        harvest(json, apiNotes);
+        analyzeMeta.total = json?.data?.total ?? analyzeMeta.total;
+        const b = url.match(/post_begin_time=(\d+)/)?.[1];
+        const t = url.match(/post_end_time=(\d+)/)?.[1];
+        if (b && t) {
+          const w = `${new Date(Number(b)).toISOString().slice(0, 10)}~${new Date(Number(t)).toISOString().slice(0, 10)}`;
+          if (!analyzeMeta.windows.includes(w)) analyzeMeta.windows.push(w);
         }
-      } catch (e) {
-        /* 非 JSON 响应或 body 已释放，忽略 */
+        sample(url, json);
+        console.log(JSON.stringify({ log: "analyze-list", got: apiNotes.length - before }));
+      } else if (/data\/note_detail_new/.test(url)) {
+        overview.noteDetailNew = distill(json?.data) ?? overview.noteDetailNew;
+      } else if (/datacenter\/account\/base/.test(url)) {
+        overview.accountBase = distill(json?.data) ?? overview.accountBase;
+      } else if (/home\/personal_info/.test(url)) {
+        const dd = json?.data ?? {};
+        if (typeof dd.fans_count === "number") account.followers = dd.fans_count;
+        if (typeof dd.follow_count === "number") account.follows = dd.follow_count;
+        if (typeof dd.faved_count === "number") account.totalLikes = dd.faved_count;
+        if (dd.grow_info?.level != null) account.growLevel = dd.grow_info.level;
+      } else if (/fans\/overall_new/.test(url)) {
+        fans.overall = distill(json?.data) ?? fans.overall;
+      } else if (/active_fans_new/.test(url)) {
+        fans.active = distill(json?.data) ?? fans.active;
+      } else if (/fans_portrait_new/.test(url)) {
+        fans.portrait = distill(json?.data) ?? fans.portrait;
+      } else if (/fans_source/.test(url)) {
+        fans.source = distill(json?.data) ?? fans.source;
+      } else if (/audience\/view\/periods/.test(url)) {
+        audience.viewPeriods = distill(json?.data) ?? audience.viewPeriods;
+      } else if (/audience\/source\/account/.test(url)) {
+        audience.sourceAccount = distill(json?.data) ?? audience.sourceAccount;
+      } else {
+        harvest(json, apiNotes); // 未分类 galaxy API：宽松收割，字段映射靠 apiSamples 核对
+        sample(url, json);
       }
     }
   } catch (e) {}
+}
+
+function sample(url, json) {
+  if (apiSamples.length >= 4) return;
+  const has = apiSamples.some((s) => url.split("?")[0].includes(s.url.split("?")[0]));
+  if (has) return;
+  apiSamples.push({ url: url.slice(0, 150), sample: JSON.stringify(json).slice(0, 1500) });
 }
 
 async function clearDialog() {
@@ -169,8 +250,8 @@ async function clearDialog() {
   } catch (e) {}
 }
 
-// 访问一个页面：加载 → 清对话框 → 收 API → 抽表格 → 存整页文本
-async function visit(url) {
+// 访问一个页面：加载 → 清对话框 → 拦截分发 → 抽表格 → 存整页文本
+async function visit(url, tag) {
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
   } catch (e) {
@@ -178,9 +259,11 @@ async function visit(url) {
   }
   await sleep(8000);
   await clearDialog();
-  await drainApi();
+  await drainApi(tag);
   const txt = await page.evaluate(() => document.body?.innerText?.slice(0, 8000)).catch(() => "");
+  if (tag) textDumps[tag] = txt;
   const rows = await extractTable();
+  if (rows && rows.length >= 2 && tag) tableRows.push({ from: tag, rows });
   return { txt, rows };
 }
 
@@ -202,15 +285,16 @@ async function extractTable() {
 }
 
 // 表格行 → 笔记记录（在前 3 行里找含「标题」的表头行）
+// 列名陷阱：内容分析页的「封面点击率」含「点击」二字，绝不能当阅读列（10-11 bug 根源之一）
 function mapTable(rows) {
   for (let h = 0; h < Math.min(3, rows.length - 1); h++) {
     const header = rows[h].map((c) => (c || "").replace(/\s/g, ""));
-    const col = (...names) => header.findIndex((cell) => cell && names.some((n) => cell.includes(n)));
+    const col = (...names) => header.findIndex((cell) => cell && names.some((n) => cell === n));
     const iT = col("标题", "笔记名称");
     if (iT < 0) continue;
-    const iTi = col("发布时间", "时间");
-    const iIm = col("曝光", "观看");
-    const iRe = col("阅读", "点击");
+    const iTi = header.findIndex((c) => c && /发布时间|时间/.test(c));
+    const iIm = col("曝光");
+    const iRe = col("观看", "阅读");
     const iL = col("点赞");
     const iC = col("收藏");
     const iCm = col("评论");
@@ -218,7 +302,7 @@ function mapTable(rows) {
     const iF = col("涨粉", "新增关注", "新增粉丝");
     const mapped = rows
       .slice(h + 1)
-      .filter((r) => r[iT] && r[iT].trim())
+      .filter((r) => r[iT] && r[iT].trim() && !/^发布于/.test(r[iT].trim()))
       .map((r) => ({
         id: null,
         title: r[iT].trim(),
@@ -237,69 +321,16 @@ function mapTable(rows) {
   return null;
 }
 
-// 按文本点击导航（多个候选选择器逐个试，全失败再用 evaluate 兜底）
-async function clickByText(text) {
-  for (const sel of [`text=${text}`, `loc=role:link[name*="${text}"]`, `loc=role:button[name*="${text}"]`]) {
-    try {
-      await page.click(sel);
-      return true;
-    } catch (e) {}
-  }
-  try {
-    return await page.evaluate((t) => {
-      const el = [...document.querySelectorAll("a,span,div")].find((e) => e.childElementCount === 0 && e.textContent.trim() === t);
-      if (el) {
-        el.click();
-        return true;
-      }
-      return false;
-    }, text);
-  } catch (e) {
-    return false;
-  }
-}
-
-// ---------- 1. creator 登录检查（判据：出现 上传图文/发布笔记 且无登录页特征；SPA 渲染竞态多等几秒） ----------
-// 校准（2026-10-07）：控制台锚点是 /publish/publish?source=official；creator 根路径会落到营销/登录页，不要用根路径做判断。
-{
-  try {
-    await page.goto("https://creator.xiaohongshu.com/publish/publish?source=official", { waitUntil: "domcontentloaded", timeout: 40000 });
-  } catch (e) {
-    console.log(JSON.stringify({ log: "login-goto-soft", msg: String(e.message).slice(0, 60) }));
-  }
-  await sleep(6000);
-  const txt = await page.evaluate(() => document.body?.innerText?.replace(/\n+/g, "|").slice(0, 300)).catch(() => "");
-  const onLoginPage = /短信登录|发送验证码|扫码登录|扫码/.test(txt);
-  const onPublishPage = /上传图文|发布笔记/.test(txt);
-  creatorOk = onPublishPage && !onLoginPage;
-  account.creatorLogin = creatorOk;
-  stages.push({ stage: "creatorLogin", ok: creatorOk, detail: txt.slice(0, 80) });
-  console.log(JSON.stringify({ log: creatorOk ? "creator-login-ok" : "creator-not-logged-in" }));
-}
-
-let userId = taskDef.userId ?? (await userIdFromCookie());
-if (userId) account.userId = userId;
-
-// ---------- 2. creator 可用：从控制台锚点出发，点导航到 数据看板 / 笔记管理 ----------
-// 校准（2026-10-07）：真实导航名是「数据看板」「笔记管理」（不是「数据中心」「内容管理」）；
-// 直接 URL（/publish/manage 等）会 404，全部走文本点击。
-const dumpText = async (key) => {
-  const t = await page.evaluate(() => document.body?.innerText?.slice(0, 8000)).catch(() => "");
-  textDumps[key] = t;
-  return t || "";
-};
-const onCreatorLogin = (t) => /短信登录|发送验证码|你访问的页面不见了/.test(t || "");
-
-// 滚动触发应用自身的分页 XHR 并拦截（creator API 需要站点 JS 的签名头，裸 fetch 拿不到，
+// 滚动触发应用自身的分页 XHR 并拦截（creator API 需要站点 JS 的签名头，page.fetch 裸调 406，
 // 所以全量数据靠「让应用自己翻页 + 拦截响应」）。连续 2 轮无新增即停。
-async function scrollAndDrain(maxRounds) {
+async function scrollAndDrain(maxRounds, tag = "manage-scroll") {
   let prev = -1;
   let stale = 0;
   for (let i = 0; i < maxRounds; i++) {
     await page.mouse.move(500, 500).catch(() => {});
     await page.mouse.wheel(0, 3000).catch(() => {});
     await sleep(2500);
-    await drainApi();
+    await drainApi(tag);
     if (apiNotes.length === prev) {
       stale += 1;
       if (stale >= 2) break;
@@ -310,80 +341,65 @@ async function scrollAndDrain(maxRounds) {
   }
 }
 
+// ---------- 1. creator 登录检查（直接用 /new/home：已登录即首页，未登录跳登录页） ----------
+// 校准（2026-10-12）：/new/home?source=official 已登录可达；根路径会落营销页，不要用根路径判断。
+{
+  try {
+    await page.goto("https://creator.xiaohongshu.com/new/home?source=official", { waitUntil: "domcontentloaded", timeout: 40000 });
+  } catch (e) {
+    console.log(JSON.stringify({ log: "login-goto-soft", msg: String(e.message).slice(0, 60) }));
+  }
+  await sleep(9000);
+  await clearDialog();
+  const txt = await page.evaluate(() => document.body?.innerText?.replace(/\n+/g, "|").slice(0, 400)).catch(() => "");
+  const onLoginPage = /短信登录|发送验证码|扫码登录|扫码/.test(txt);
+  const onHome = /创作服务平台/.test(txt) && /发布笔记|笔记数据总览|粉丝数/.test(txt);
+  creatorOk = onHome && !onLoginPage;
+  account.creatorLogin = creatorOk;
+  stages.push({ stage: "creatorLogin", ok: creatorOk, detail: txt.slice(0, 80) });
+  console.log(JSON.stringify({ log: creatorOk ? "creator-login-ok" : "creator-not-logged-in" }));
+  if (creatorOk) await drainApi("home"); // 首页加载期已发出的 note_detail_new / personal_info / account/base
+}
+
+const userId = taskDef.userId ?? (await userIdFromCookie());
+if (userId) account.userId = userId;
+
+// ---------- 2. creator 可用：四页直连采集 ----------
+// 校准（2026-10-12）：四个页面都有稳定直接 URL，无需点导航。
+const onCreatorLogin = (t) => /短信登录|发送验证码|你访问的页面不见了/.test(t || "");
+
 if (creatorOk) {
-  // 2a. 直接分页调笔记列表 API（主路径）
-  // 校准（2026-10-07）：GET /api/galaxy/v2/creator/note/user/posted?tab=0&page=N（同源、带会话、每页 ~12 条）
-  {
-    const pageSize = 12;
-    const pages = Math.min(8, Math.ceil(maxNotes / pageSize) + 1);
-    let fetched = 0;
-    try {
-      for (let p = 0; p < pages; p++) {
-        const res = await page.fetch(`/api/galaxy/v2/creator/note/user/posted?tab=0&page=${p}`, { timeout: 15000 }).catch(() => null);
-        if (!res || !res.ok) break;
-        const data = JSON.parse(res.body);
-        const list = data?.data?.notes;
-        if (!Array.isArray(list) || !list.length) break;
-        const before = apiNotes.length;
-        harvest(data, apiNotes);
-        fetched += apiNotes.length - before;
-        if (list.length < pageSize) break;
-        await sleep(800);
-      }
-    } catch (e) {
-      console.log(JSON.stringify({ log: "posted-api-fail", msg: String(e.message).slice(0, 60) }));
-    }
-    stages.push({ stage: "postedApi", ok: fetched > 0, notes: fetched });
-    console.log(JSON.stringify({ log: "posted-api", notes: fetched }));
-  }
+  // 2a. 账号概览（受众活跃时段 + 流量来源；account/base 若首页未截到在此兜底）
+  await visit("https://creator.xiaohongshu.com/statistics/account/v2?source=official", "accountOverview");
+  stages.push({ stage: "accountOverview", ok: !!(audience.viewPeriods || overview.accountBase) });
 
-  // 2b. 数据看板 → 内容分析（补充：账号概览/阅读数据；失败不致命）
-  // 校准（2026-10-07）：数据看板的子页签是「账号概览 / 内容分析 / 粉丝数据」，笔记明细在「内容分析」。
-  {
-    let dcOk = false;
-    await dumpText("publishConsole");
-    try {
-      if (await clickByText("数据看板")) {
-        await sleep(5000);
-        await drainApi();
-        let txt = await dumpText("dataCenter");
-        if (!/曝光|阅读|观看/.test(txt) && !onCreatorLogin(txt)) {
-          for (const sub of ["内容分析", "笔记数据"]) {
-            if (await clickByText(sub)) {
-              await sleep(6000);
-              await drainApi();
-              txt = await dumpText("dataCenter");
-              if (/曝光|阅读|观看/.test(txt)) break;
-            }
-          }
-        }
-        const rows = await extractTable();
-        if (rows && rows.length >= 2) tableRows.push({ from: "dataCenter", rows });
-        dcOk = /曝光|阅读|观看/.test(txt) && !onCreatorLogin(txt);
-        if (dcOk) await scrollAndDrain(10);
-      }
-    } catch (e) {
-      console.log(JSON.stringify({ log: "dc-click-fail", msg: String(e.message).slice(0, 60) }));
-    }
-    stages.push({ stage: "dataCenter", ok: dcOk });
-  }
+  // 2b. 粉丝数据（涨粉趋势 + 铁粉榜 + 画像）
+  await visit("https://creator.xiaohongshu.com/statistics/fans-data?source=official", "fansData");
+  stages.push({ stage: "fansData", ok: !!(fans.overall || fans.portrait) });
 
-  // 2c. 笔记管理（补充：全量列表 + 可见状态；失败不致命）
-  {
-    let cmOk = false;
-    try {
-      if (await clickByText("笔记管理")) {
-        await sleep(6000);
-        await drainApi();
-        const txt = await dumpText("contentManage");
-        const rows = await extractTable();
-        if (rows && rows.length >= 2) tableRows.push({ from: "contentManage", rows });
-        cmOk = /标题|状态|审核|数据/.test(txt) && !onCreatorLogin(txt);
-        if (cmOk) await scrollAndDrain(12);
-      }
-    } catch (e) {}
-    stages.push({ stage: "contentManage", ok: cmOk });
+  // 2b+. 内容分析（阅读数 read_count，默认窗口近 30 天；10-12 试跑曾漏访此页导致 reads 全 null）
+  await visit("https://creator.xiaohongshu.com/statistics/data-analysis?source=official", "contentAnalysis");
+  if (analyzeMeta.total != null && analyzeMeta.total > 10) await scrollAndDrain(6, "analysis-scroll"); // 表格分页未必由滚动触发，尽力而为
+  stages.push({ stage: "contentAnalysis", ok: analyzeMeta.total != null, total: analyzeMeta.total });
+
+  // 2c. 笔记管理（主路径：posted API 滚动翻页全量 + 内容分析 analyze/list 随导航自动拦截）
+  // 校准（2026-10-12）：page.fetch 直调 406，滚动翻页是唯一可靠路径（10-11 的首页 0 条即 fetch 所致）
+  let manageOk = false;
+  try {
+    await page.goto("https://creator.xiaohongshu.com/new/note-manager?source=official", { waitUntil: "domcontentloaded", timeout: 40000 });
+    await sleep(8000);
+    await clearDialog();
+    await drainApi("manage-load");
+    const txt = await page.evaluate(() => document.body?.innerText?.slice(0, 8000)).catch(() => "");
+    textDumps.contentManage = txt;
+    const rows = await extractTable();
+    if (rows && rows.length >= 2) tableRows.push({ from: "contentManage", rows });
+    manageOk = /标题|状态|审核|已发布/.test(txt) && !onCreatorLogin(txt);
+    if (manageOk) await scrollAndDrain(16);
+  } catch (e) {
+    console.log(JSON.stringify({ log: "manage-fail", msg: String(e.message).slice(0, 60) }));
   }
+  stages.push({ stage: "noteManager", ok: manageOk, notes: apiNotes.length });
 } else {
   console.log(JSON.stringify({ log: "skip-creator-stages" }));
 }
@@ -392,12 +408,12 @@ if (creatorOk) {
 // 校准（2026-10-07）：www 未登录时主页有「登录即可查看 Ta 的笔记」遮罩，此时 DOM 里仍能抓到
 // 头像链接（其 id 是 userId 而非笔记 id），会造假数据——先检测遮罩，命中就跳过卡片提取。
 const onWwwLoginWall = (t) => /登录即可查看|短信登录|扫码登录/.test(t || "");
-let profileUrl = taskDef.profileUrl || (userId ? `https://www.xiaohongshu.com/user/profile/${userId}` : null);
+const profileUrl = taskDef.profileUrl || (userId ? `https://www.xiaohongshu.com/user/profile/${userId}` : null);
 if (profileUrl) {
-  const { txt } = await visit(profileUrl);
+  const { txt } = await visit(profileUrl, "profile");
   if (onWwwLoginWall(txt)) {
     stages.push({ stage: "profile", ok: false, reason: "www-not-logged-in" });
-    console.log(JSON.stringify({ log: "www-not-logged-in", hint: "creator 数据可能已足够；如需主页公开数据请在 Ego Lite 登录 www.xiaohongshu.com" }));
+    console.log(JSON.stringify({ log: "www-not-logged-in", hint: "creator 数据已足够；如需主页公开数据请在 Ego Lite 登录 www.xiaohongshu.com" }));
   } else {
     // 滚动两屏触发懒加载
     await page.mouse.move(500, 500).catch(() => {});
@@ -405,7 +421,7 @@ if (profileUrl) {
     await sleep(3000);
     await page.mouse.wheel(0, 2500).catch(() => {});
     await sleep(3000);
-    await drainApi();
+    await drainApi("profile");
     const cards = await page
       .evaluate((sel) => {
         const links = [...document.querySelectorAll(sel)];
@@ -423,22 +439,7 @@ if (profileUrl) {
       }, "a[href*='/explore/'], a[href*='/user/profile/']")
       .catch(() => []);
     wwwOk = cards.length > 0;
-    textDumps.profile = txt;
     if (wwwOk) {
-      const ov = await page
-        .evaluate(() => {
-          const t = document.body?.innerText?.slice(0, 2000) || "";
-          const grab = (label) => {
-            const m = t.match(new RegExp(label + "[\\s\\.:]*([\\d.万wW+,]+)"));
-            return m ? m[1] : null;
-          };
-          return { followers: grab("粉丝"), totalLikes: grab("获赞与收藏") || grab("获赞") };
-        })
-        .catch(() => null);
-      if (ov) {
-        if (ov.followers) account.followers = parseCount(ov.followers);
-        if (ov.totalLikes) account.totalLikes = parseCount(ov.totalLikes);
-      }
       for (const html of cards) {
         const id = (html.match(/([0-9a-f]{24})/) || [])[1];
         if (!id || (userId && id === userId)) continue; // 头像/主页链接不是笔记
@@ -504,7 +505,7 @@ for (const t of tableRows) {
   if (mapped) mergeIn(mapped, `table:${t.from}`);
 }
 
-let notes = [...byKey.values()]
+const notes = [...byKey.values()]
   .filter((n) => n.title || n.id)
   .sort((a, b) => String(b.publishedAt || "").localeCompare(String(a.publishedAt || "")))
   .slice(0, maxNotes);
@@ -533,9 +534,6 @@ for (const n of detailTargets) {
         title: document.querySelector("#detail-title")?.textContent?.trim() ?? null,
         desc: desc?.innerText?.slice(0, 2000) ?? null,
         topics: desc ? [...desc.querySelectorAll("a.tag")].map((a) => a.textContent.trim().replace(/^#/, "")).filter(Boolean) : null,
-        likes: pick([".like-wrapper .count", "[class*='like'] .count"]),
-        collects: pick([".collect-wrapper .count", "[class*='collect'] .count"]),
-        comments: pick([".chat-wrapper .count", "[class*='chat'] .count"]),
         time: pick([".bottom-container", "[class*='date']"]),
       };
     })
@@ -551,8 +549,9 @@ for (const n of detailTargets) {
 }
 stages.push({ stage: "details", ok: true, fetched: detailTargets.length });
 
-// ---------- 7. 封面下载（best-effort，≤12 张） ----------
+// ---------- 7. 封面下载（best-effort，≤12 张）+ 索引回写 ----------
 const withCovers = notes.filter((n) => n.coverUrl).slice(0, 12);
+const coverIndex = {};
 if (withCovers.length) {
   const coversDir = join(OUT, `covers-${today}`);
   await mkdir(coversDir, { recursive: true });
@@ -561,11 +560,14 @@ if (withCovers.length) {
     try {
       await page.fetch(n.coverUrl, { saveAs: join(coversDir, name), timeout: 15000 });
       n.coverFile = `covers-${today}/${name}`;
+      coverIndex[n.id || n.title] = n.coverFile; // 10-11 bug 修复：索引文件兜底映射，即便 coverFile 回写失败也能人工对齐
     } catch (e) {
       /* 封面失败不影响样本 */
     }
   }
+  await writeFile(join(OUT, "covers-index.json"), JSON.stringify(coverIndex, null, 2)).catch(() => {});
 }
+stages.push({ stage: "covers", ok: true, fetched: Object.keys(coverIndex).length });
 
 // ---------- 8. 写 snapshot ----------
 const summary = {
@@ -574,6 +576,10 @@ const summary = {
   source: [...new Set(stages.filter((s) => s.ok).map((s) => s.stage))].join("+") || "none",
   degraded: notes.length < 5,
   account,
+  overview, // 近7/30日全指标+日粒度+环比（noteDetailNew）与账号概览补充（accountBase）
+  fans, // 涨粉趋势 / 铁粉榜 / 画像 / 来源
+  audience, // 受众活跃时段 / 流量来源
+  analyzeMeta, // 内容分析窗口与覆盖总量（reads 的覆盖范围说明）
   stages,
   apiSamples,
   notes,
@@ -581,5 +587,18 @@ const summary = {
 };
 const outPath = join(OUT, `${today}-snapshot.json`);
 await writeFile(outPath, JSON.stringify(summary, null, 2));
-console.log(JSON.stringify({ ok: !summary.degraded, out: outPath, total: notes.length, source: summary.source, degraded: summary.degraded }));
+console.log(
+  JSON.stringify({
+    ok: !summary.degraded,
+    out: outPath,
+    total: notes.length,
+    source: summary.source,
+    degraded: summary.degraded,
+    readsCovered: analyzeMeta.total,
+    hasOverview: !!overview.noteDetailNew,
+    hasFans: !!fans.overall,
+    hasPortrait: !!fans.portrait,
+    hasAudience: !!audience.viewPeriods,
+  })
+);
 await task.finish({ keep: [] });
